@@ -1,0 +1,10 @@
+fastapi
+google
+openpyxl
+playwright
+primp
+protobuf
+pydantic
+selectolax
+typing_extensions
+fast-flights
