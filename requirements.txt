@@ -8,3 +8,4 @@ pydantic
 selectolax
 typing_extensions
 fast-flights
+uvicorn
