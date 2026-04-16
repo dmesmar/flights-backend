@@ -3,6 +3,7 @@ Backend API for flights search.
 Run with: uvicorn backend:app --reload --port 8000
 """
 import re
+import math
 import time
 import os
 import logging
@@ -99,6 +100,7 @@ class SearchRequest(BaseModel):
     airport_from: List[str] = Field(..., examples=[["RTM"]])
     airport_to: List[str] = Field(..., examples=[["VLC"]])
     max_stops: int = Field(default=1, ge=0, le=3)
+    max_results: int = Field(default=3, ge=1, description="Máx. vuelos baratos por día")
 
 
 class FlightResult(BaseModel):
@@ -124,6 +126,19 @@ class SearchResponse(BaseModel):
     vuelos: List[FlightResult]
 
 
+class PriceRequest(BaseModel):
+    fecha: str = Field(..., examples=["06-06-2026"], description="DD-MM-YYYY")
+    origen: str = Field(..., examples=["VLC"])
+    destino: str = Field(..., examples=["ZRH"])
+    salida: str = Field(..., examples=["06:00"], description="HH:MM en formato 24h")
+    aerolinea: str = Field(..., examples=["SWISS"])
+    escalas: int = Field(..., ge=0)
+
+
+class PriceResponse(BaseModel):
+    precio: Optional[str]
+
+
 # ============================================================================
 # CORE LOGIC (extracted from test.py)
 # ============================================================================
@@ -146,8 +161,8 @@ def convert_to_24h(time_str: str) -> str:
     return f"{hour:02d}:{minute} {date_part}"
 
 
-def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: int):
-    """Fetch hasta 3 vuelos baratos para un día. Seguro para usar en threads."""
+def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: int, max_results: int = 3):
+    """Fetch hasta max_results vuelos baratos para un día. Seguro para usar en threads."""
     vuelos_unicos: list = []
     result = None
     for intento in range(1, 4):
@@ -169,7 +184,7 @@ def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: i
                     if clave not in vuelos_vistos:
                         vuelos_vistos.add(clave)
                         vuelos_unicos.append(flight)
-                    if len(vuelos_unicos) >= 3:
+                    if len(vuelos_unicos) >= max_results:
                         break
                 if vuelos_unicos:
                     break
@@ -188,6 +203,7 @@ def crear_filtro_main(
     airport_from: List[str],
     airport_to: List[str],
     max_stops: int = 1,
+    max_results: int = 3,
 ) -> dict:
     """Busca vuelos para cada combinación origen/destino en el rango de fechas."""
     if isinstance(airport_from, str):
@@ -229,7 +245,7 @@ def crear_filtro_main(
     )
     log(f"       Máximo escalas: {max_stops}\n", min_level=2)
 
-    import math
+    
     sqrt_days = int(math.isqrt(total_days))
     workers = next((i for i in range(sqrt_days, 0, -1) if total_days % i == 0), 1)
     workers = max(3, min(workers, 8))
@@ -245,7 +261,7 @@ def crear_filtro_main(
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
-                    executor.submit(_buscar_dia, from_airport, to_airport, fecha_str, max_stops): fecha_str
+                    executor.submit(_buscar_dia, from_airport, to_airport, fecha_str, max_stops, max_results): fecha_str
                     for fecha_str in fechas
                 }
                 for future in as_completed(futures):
@@ -314,6 +330,49 @@ def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: 
 # ENDPOINTS
 # ============================================================================
 
+@app.post("/api/price", response_model=PriceResponse)
+def get_price(req: PriceRequest) -> PriceResponse:
+    """
+    Devuelve el precio actualizado de un vuelo concreto.
+    Busca por fecha, ruta, hora de salida (HH:MM), aerolínea y escalas.
+    """
+    try:
+        fecha_api = datetime.strptime(req.fecha, "%d-%m-%Y").strftime("%Y-%m-%d")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Formato de fecha inválido: {e}")
+
+    for intento in range(1, 4):
+        try:
+            filter_obj = create_filter(
+                flight_data=[FlightData(date=fecha_api, from_airport=req.origen, to_airport=req.destino)],
+                trip="one-way",
+                passengers=Passengers(adults=1, children=0, infants_in_seat=0, infants_on_lap=0),
+                seat="economy",
+                max_stops=req.escalas,
+            )
+            result = get_flights_from_filter(filter_obj, mode="common")
+            if result and isinstance(result, Result) and result.flights:
+                for flight in result.flights:
+                    salida_24h = convert_to_24h(flight.departure)
+                    # Extraer solo HH:MM del resultado (ej. "06:00 on Jun 6" → "06:00")
+                    salida_hhmm = salida_24h[:5]
+                    if (
+                        salida_hhmm == req.salida[:5]
+                        and req.aerolinea.lower() in flight.name.lower()
+                        and flight.stops <= req.escalas
+                    ):
+                        return PriceResponse(precio=flight.price)
+                # Encontrado resultado pero no coincide el vuelo exacto
+                return PriceResponse(precio=None)
+        except Exception as e:
+            if "No flights found" in str(e):
+                return PriceResponse(precio=None)
+            if intento < 3:
+                time.sleep(0.5)
+
+    return PriceResponse(precio=None)
+
+
 @app.get("/api/progress")
 def get_progress() -> dict:
     return search_progress
@@ -354,6 +413,7 @@ def search_flights(req: SearchRequest) -> SearchResponse:
             airport_from=req.airport_from,
             airport_to=req.airport_to,
             max_stops=req.max_stops,
+            max_results=req.max_results,
         )
         return serializar_resultados(resultados)
     except Exception as e:
