@@ -174,7 +174,7 @@ def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: i
                 seat="economy",
                 max_stops=max_stops,
             )
-            result = get_flights_from_filter(filter_obj, mode="fallback")
+            result = get_flights_from_filter(filter_obj, mode="force-fallback")
             if result and isinstance(result, Result) and result.flights:
                 vuelos_vistos: set = set()
                 for flight in sorted(result.flights, key=lambda x: float(x.price.replace("€", ""))):
@@ -350,7 +350,7 @@ def get_price(req: PriceRequest) -> PriceResponse:
                 seat="economy",
                 max_stops=req.escalas,
             )
-            result = get_flights_from_filter(filter_obj, mode="fallback")
+            result = get_flights_from_filter(filter_obj, mode="force-fallback")
             if result and isinstance(result, Result) and result.flights:
                 for flight in result.flights:
                     salida_24h = convert_to_24h(flight.departure)
