@@ -8,6 +8,7 @@ import time
 import os
 import logging
 import threading
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -26,18 +27,19 @@ from fast_flights.schema import Result
 # ============================================================================
 log_level: int = int(os.environ.get("LOG_LEVEL", "2"))
 _log_buffer: deque = deque(maxlen=500)
-search_progress: dict = {"percent": 0.0, "message": "", "completed": 0, "total": 0}
+_search_progress: dict = {}  # search_id -> progress dict
 _progress_lock = threading.Lock()
 
 
-def _progress_tick(label: str) -> None:
+def _progress_tick(search_id: str, label: str) -> None:
     """Incrementa el contador de progreso de forma thread-safe."""
     with _progress_lock:
-        search_progress["completed"] += 1
-        done = search_progress["completed"]
-        total = search_progress["total"]
-        search_progress["percent"] = round(done / total * 100, 1) if total else 0.0
-        search_progress["message"] = f"{label} — {done}/{total} días"
+        prog = _search_progress[search_id]
+        prog["completed"] += 1
+        done = prog["completed"]
+        total = prog["total"]
+        prog["percent"] = round(done / total * 100, 1) if total else 0.0
+        prog["message"] = f"{label} — {done}/{total} días"
 
 
 _LEVEL_NAMES = {1: "INFO", 2: "INFO", 3: "DEBUG"}
@@ -101,6 +103,7 @@ class SearchRequest(BaseModel):
     airport_to: List[str] = Field(..., examples=[["VLC"]])
     max_stops: int = Field(default=1, ge=0, le=3)
     max_results: int = Field(default=3, ge=1, description="Máx. vuelos baratos por día")
+    search_id: Optional[str] = Field(default=None, description="ID único para seguimiento de progreso")
 
 
 class FlightResult(BaseModel):
@@ -121,6 +124,7 @@ class FlightResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
+    search_id: str = ""
     rutas: List[str]
     total_vuelos: int
     vuelos: List[FlightResult]
@@ -204,6 +208,7 @@ def crear_filtro_main(
     airport_to: List[str],
     max_stops: int = 1,
     max_results: int = 3,
+    search_id: str = "",
 ) -> dict:
     """Busca vuelos para cada combinación origen/destino en el rango de fechas."""
     if isinstance(airport_from, str):
@@ -225,10 +230,12 @@ def crear_filtro_main(
     total_units = len(rutas_validas) * total_days
 
     with _progress_lock:
-        search_progress["percent"] = 0.0
-        search_progress["completed"] = 0
-        search_progress["total"] = total_units
-        search_progress["message"] = "Iniciando búsqueda…"
+        _search_progress[search_id] = {
+            "percent": 0.0,
+            "completed": 0,
+            "total": total_units,
+            "message": "Iniciando búsqueda…",
+        }
 
     resultados_por_ruta: dict = {}
 
@@ -267,7 +274,7 @@ def crear_filtro_main(
                 for future in as_completed(futures):
                     fecha_str, vuelos_unicos, total_v = future.result()
 
-                    _progress_tick(ruta_key)
+                    _progress_tick(search_id, ruta_key)
 
                     if vuelos_unicos:
                         log(f"OK [{fecha_str}] - {vuelos_unicos[0].price} ({total_v} vuelos)", min_level=3)
@@ -284,8 +291,8 @@ def crear_filtro_main(
             resultados_por_ruta[ruta_key].sort(key=lambda x: x["fecha"])
             log("", min_level=2)
 
-    search_progress["percent"] = 100.0
-    search_progress["message"] = "Búsqueda completada"
+    _search_progress[search_id]["percent"] = 100.0
+    _search_progress[search_id]["message"] = "Búsqueda completada"
     return resultados_por_ruta
 
 
@@ -379,8 +386,10 @@ def ping() -> dict:
 
 
 @app.get("/api/progress")
-def get_progress() -> dict:
-    return search_progress
+def get_progress(search_id: Optional[str] = None) -> dict:
+    if search_id:
+        return _search_progress.get(search_id, {"percent": 0.0, "message": "No encontrado", "completed": 0, "total": 0})
+    return {"percent": 0.0, "message": "Proporciona search_id como parámetro", "completed": 0, "total": 0}
 
 
 @app.get("/api/logs")
@@ -411,6 +420,7 @@ def search_flights(req: SearchRequest) -> SearchResponse:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"Formato de fecha inválido: {e}")
 
+    search_id = req.search_id or str(uuid.uuid4())
     try:
         resultados = crear_filtro_main(
             fecha_ini=req.fecha_ini,
@@ -419,8 +429,15 @@ def search_flights(req: SearchRequest) -> SearchResponse:
             airport_to=req.airport_to,
             max_stops=req.max_stops,
             max_results=req.max_results,
+            search_id=search_id,
         )
-        return serializar_resultados(resultados)
+        result = serializar_resultados(resultados)
+        return SearchResponse(
+            search_id=search_id,
+            rutas=result.rutas,
+            total_vuelos=result.total_vuelos,
+            vuelos=result.vuelos,
+        )
     except Exception as e:
         log(f"[ERROR] {e}", min_level=1)
         raise HTTPException(status_code=500, detail=str(e))
