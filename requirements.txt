@@ -1,7 +1,6 @@
 fastapi
 google
 openpyxl
-playwright
 primp
 protobuf
 pydantic
