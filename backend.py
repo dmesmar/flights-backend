@@ -373,6 +373,11 @@ def get_price(req: PriceRequest) -> PriceResponse:
     return PriceResponse(precio=None)
 
 
+@app.get("/api/ping")
+def ping() -> dict:
+    return {"status": "ok"}
+
+
 @app.get("/api/progress")
 def get_progress() -> dict:
     return search_progress
