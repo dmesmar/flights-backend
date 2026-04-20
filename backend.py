@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from urllib.parse import urlencode
 from fast_flights import create_filter, get_flights_from_filter, FlightData, Passengers
 from fast_flights.schema import Result
 
@@ -121,6 +122,7 @@ class FlightResult(BaseModel):
     precio: str
     total_vuelos: int
     mas_barato: bool
+    url: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -296,6 +298,40 @@ def crear_filtro_main(
     return resultados_por_ruta
 
 
+def _build_flight_url(
+    from_airport: str,
+    to_airport: str,
+    fecha_str: str,
+    stops: int,
+    price_str: str,
+    salida: Optional[str] = None,
+    currency: str = "EUR",
+) -> str:
+    """Genera URL de Google Flights: ruta, fecha, escalas exactas, moneda, precio máximo y hora de salida en tfs."""
+    price_match = re.search(r'(\d+)', price_str.replace(',', ''))
+    max_price = int(price_match.group(1)) if price_match else None
+
+    # Parsear la hora de salida (formato "HH:MM ...")
+    dep_hour: Optional[int] = None
+    if salida and len(salida) >= 5:
+        try:
+            dep_hour = int(salida[:2])
+        except ValueError:
+            pass
+
+    from fast_flights.filter import create_filter as _cf
+    fd = FlightData(date=fecha_str, from_airport=from_airport, to_airport=to_airport, dep_hour=dep_hour)
+    filter_obj = _cf(
+        flight_data=[fd],
+        trip="one-way",
+        passengers=Passengers(adults=1, children=0, infants_in_seat=0, infants_on_lap=0),
+        seat="economy",
+        max_stops=stops,
+    )
+    filter_obj.max_price = max_price
+    return filter_obj.as_url(currency=currency)
+
+
 def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: str = "") -> SearchResponse:
     """Convierte los objetos de vuelo en dicts serializables."""
     vuelos: List[FlightResult] = []
@@ -307,6 +343,14 @@ def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: 
             for ranking, flight in enumerate(res["vuelos_baratos"], 1):
                 salida = convert_to_24h(flight.departure).replace(", ", " ")
                 llegada = convert_to_24h(flight.arrival).replace(", ", " ")
+                flight_url = _build_flight_url(
+                    from_airport=origen_ruta,
+                    to_airport=destino_ruta,
+                    fecha_str=res["fecha"],
+                    stops=flight.stops,
+                    price_str=flight.price,
+                    salida=salida,
+                )
                 vuelos.append(
                     FlightResult(
                         fecha=fecha,
@@ -323,6 +367,7 @@ def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: 
                         precio=flight.price,
                         total_vuelos=res["total_vuelos"],
                         mas_barato=(ranking == 1),
+                        url=flight_url,
                     )
                 )
 

@@ -23,12 +23,13 @@ class FlightData:
         airlines (List[str], optional): Airlines this flight should be taken with. Default is None.
     """
 
-    __slots__ = ("date", "from_airport", "to_airport", "max_stops", "airlines")
+    __slots__ = ("date", "from_airport", "to_airport", "max_stops", "airlines", "dep_hour")
     date: str
     from_airport: str
     to_airport: str
     max_stops: Optional[int]
     airlines: Optional[List[str]]
+    dep_hour: Optional[int]
 
     def __init__(
         self,
@@ -38,6 +39,7 @@ class FlightData:
         to_airport: Union[Airport, str],
         max_stops: Optional[int] = None,
         airlines: Optional[List[str]] = None,
+        dep_hour: Optional[int] = None,
     ):
         self.date = date
         self.from_airport = (
@@ -47,6 +49,7 @@ class FlightData:
             to_airport.value if isinstance(to_airport, Airport) else to_airport
         )
         self.max_stops = max_stops
+        self.dep_hour = dep_hour
         # TODO: All the list of airlines should technically be added to ._generated_enum like Airports
         # but I don't know how to find the comprehensive list of airlines now.
         if airlines is not None:
@@ -128,13 +131,15 @@ class TFSData:
         seat: PB.Seat,  # type: ignore
         trip: PB.Trip,  # type: ignore
         passengers: Passengers,
-        max_stops: Optional[int] = None,  # Add max_stops to the constructor
+        max_stops: Optional[int] = None,
+        max_price: Optional[int] = None,
     ):
         self.flight_data = flight_data
         self.seat = seat
         self.trip = trip
         self.passengers = passengers
-        self.max_stops = max_stops  # Store max_stops
+        self.max_stops = max_stops
+        self.max_price = max_price
 
     def pb(self) -> PB.Info:  # type: ignore
         info = PB.Info()
@@ -153,11 +158,102 @@ class TFSData:
 
         return info
 
+    @staticmethod
+    def _varint(value: int) -> bytes:
+        out = []
+        while value > 0x7f:
+            out.append((value & 0x7f) | 0x80)
+            value >>= 7
+        out.append(value & 0x7f)
+        return bytes(out)
+
+    @staticmethod
+    def _decode_var(data: bytes, pos: int):
+        result = 0; shift = 0
+        while True:
+            b = data[pos]; pos += 1
+            result |= (b & 0x7f) << shift
+            if not (b & 0x80): break
+            shift += 7
+        return result, pos
+
+    @classmethod
+    def _inject_dep_hour(cls, data: bytes, flight_data_list: list) -> bytes:
+        """Inyecta los campos dep_hour dentro de cada submensaje FlightData (field 3) del protobuf."""
+        if not any(getattr(fd, 'dep_hour', None) is not None for fd in flight_data_list):
+            return data
+
+        result = bytearray()
+        i = 0
+        fd_idx = 0
+
+        while i < len(data):
+            tag, ni = cls._decode_var(data, i)
+            wire_type = tag & 7
+            field_num = tag >> 3
+
+            if field_num == 3 and wire_type == 2:
+                # FlightData submessage
+                length, ni2 = cls._decode_var(data, ni)
+                body = bytearray(data[ni2: ni2 + length])
+
+                fd = flight_data_list[fd_idx] if fd_idx < len(flight_data_list) else None
+                fd_idx += 1
+                dep_hour = getattr(fd, 'dep_hour', None)
+
+                if dep_hour is not None:
+                    h = int(dep_hour)
+                    # field 8 = dep_hour_from, field 9 = dep_hour_to (same hour = 1h window)
+                    # field 10 = arr_hour_from (0), field 11 = arr_hour_to (23 = no filter)
+                    body += (
+                        b'\x40' + cls._varint(h) +
+                        b'\x48' + cls._varint(h) +
+                        b'\x50\x00\x58\x17'
+                    )
+
+                result += data[i: ni]          # tag bytes
+                result += cls._varint(len(body))
+                result += body
+                i = ni2 + length
+
+            elif wire_type == 0:
+                val, ni2 = cls._decode_var(data, ni)
+                result += data[i: ni2]
+                i = ni2
+            elif wire_type == 2:
+                length, ni2 = cls._decode_var(data, ni)
+                result += data[i: ni2 + length]
+                i = ni2 + length
+            elif wire_type == 5:
+                result += data[i: ni + 4]
+                i = ni + 4
+            elif wire_type == 1:
+                result += data[i: ni + 8]
+                i = ni + 8
+            else:
+                result += data[i:]
+                break
+
+        return bytes(result)
+
     def to_string(self) -> bytes:
-        return self.pb().SerializeToString()
+        raw = self.pb().SerializeToString()
+        raw = self._inject_dep_hour(raw, self.flight_data)
+        if self.max_price is not None:
+            # Field 12, wire type 0 (varint) = tag 0x60; value = price in EUR
+            raw += b'\x60' + self._varint(self.max_price)
+        return raw
 
     def as_b64(self) -> bytes:
         return base64.b64encode(self.to_string())
+
+    def as_url(self, currency: str = "", hl: str = "en") -> str:
+        """Genera la URL de Google Flights para esta búsqueda."""
+        from urllib.parse import urlencode
+        params: dict = {"tfs": self.as_b64().decode("utf-8"), "hl": hl}
+        if currency:
+            params["curr"] = currency
+        return "https://www.google.com/travel/flights?" + urlencode(params)
 
     @staticmethod
     def from_interface(
@@ -166,7 +262,8 @@ class TFSData:
         trip: Literal["round-trip", "one-way", "multi-city"],
         passengers: Passengers,
         seat: Literal["economy", "premium-economy", "business", "first"],
-        max_stops: Optional[int] = None,  # Add max_stops to the method signature
+        max_stops: Optional[int] = None,
+        max_price: Optional[int] = None,
     ):
         """Use ``?tfs=`` from an interface.
 
@@ -194,7 +291,8 @@ class TFSData:
             seat=seat_t,
             trip=trip_t,
             passengers=passengers,
-            max_stops=max_stops  # Pass max_stops into TFSData
+            max_stops=max_stops,
+            max_price=max_price,
         )
 
     def __repr__(self) -> str:
