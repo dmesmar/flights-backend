@@ -29,6 +29,8 @@ from fast_flights.schema import Result
 log_level: int = int(os.environ.get("LOG_LEVEL", "2"))
 _log_buffer: deque = deque(maxlen=500)
 _search_progress: dict = {}  # search_id -> progress dict
+_search_results: dict = {}   # search_id -> SearchResponse (actualizado en vivo por threads)
+_resolve_jobs: dict = {}     # resolve_id -> {status, precio, intento}
 _progress_lock = threading.Lock()
 
 
@@ -145,6 +147,17 @@ class PriceResponse(BaseModel):
     precio: Optional[str]
 
 
+class ResolveStartResponse(BaseModel):
+    resolve_id: str
+
+
+class ResolveStatusResponse(BaseModel):
+    resolve_id: str
+    status: str          # "pending" | "found" | "exhausted"
+    precio: Optional[str] = None
+    intento: int = 0
+
+
 # ============================================================================
 # CORE LOGIC (extracted from test.py)
 # ============================================================================
@@ -167,6 +180,15 @@ def convert_to_24h(time_str: str) -> str:
     return f"{hour:02d}:{minute} {date_part}"
 
 
+def _safe_price(price_str: str) -> float:
+    """Parsea el precio de forma segura. Devuelve inf para precios ocultos o inválidos."""
+    try:
+        val = float(re.sub(r'[^\d.]', '', price_str))
+        return val if val > 0 else float('inf')
+    except (ValueError, TypeError):
+        return float('inf')
+
+
 def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: int, max_results: int = 3):
     """Fetch hasta max_results vuelos baratos para un día. Seguro para usar en threads."""
     vuelos_unicos: list = []
@@ -183,22 +205,36 @@ def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: i
             result = get_flights_from_filter(filter_obj, mode="common")
             if result and isinstance(result, Result) and result.flights:
                 vuelos_vistos: set = set()
-                for flight in sorted(result.flights, key=lambda x: float(x.price.replace("€", ""))):
+                vuelos_unicos = []
+                vuelos_precio_oculto = []
+                for flight in sorted(result.flights, key=lambda x: _safe_price(x.price)):
                     if not all([flight.name, flight.departure, flight.arrival, flight.duration]):
                         continue
                     clave = (flight.name, flight.departure, flight.arrival, flight.price)
-                    if clave not in vuelos_vistos:
-                        vuelos_vistos.add(clave)
+                    if clave in vuelos_vistos:
+                        continue
+                    vuelos_vistos.add(clave)
+                    if _safe_price(flight.price) == float('inf'):
+                        # Precio oculto (ej. Wizz Air): guardar aparte para añadir al final
+                        vuelos_precio_oculto.append(flight)
+                    else:
                         vuelos_unicos.append(flight)
                     if len(vuelos_unicos) >= max_results:
                         break
+                # Rellenar huecos restantes con vuelos de precio oculto
+                for flight in vuelos_precio_oculto:
+                    if len(vuelos_unicos) >= max_results:
+                        break
+                    vuelos_unicos.append(flight)
                 if vuelos_unicos:
                     break
         except Exception as e:
             if "No flights found" in str(e):
-                break
-            if intento < 3:
+                if intento < 3:
+                    time.sleep(1.5)
+            elif intento < 3:
                 time.sleep(0.5)
+
     total_v = len(result.flights) if result and isinstance(result, Result) else 0
     return fecha_str, vuelos_unicos, total_v
 
@@ -309,7 +345,8 @@ def _build_flight_url(
 ) -> str:
     """Genera URL de Google Flights: ruta, fecha, escalas exactas, moneda, precio máximo y hora de salida en tfs."""
     price_match = re.search(r'(\d+)', price_str.replace(',', ''))
-    max_price = int(price_match.group(1)) if price_match else None
+    raw_price = int(price_match.group(1)) if price_match else 0
+    max_price = raw_price if raw_price > 0 else None  # precio oculto → sin filtro de precio
 
     # Parsear la hora de salida (formato "HH:MM ...")
     dep_hour: Optional[int] = None
@@ -364,9 +401,9 @@ def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: 
                         adelanto_llegada=getattr(flight, "arrival_time_ahead", ""),
                         duracion=flight.duration,
                         escalas=flight.stops,
-                        precio=flight.price,
+                        precio=flight.price if _safe_price(flight.price) != float('inf') else "–",
                         total_vuelos=res["total_vuelos"],
-                        mas_barato=(ranking == 1),
+                        mas_barato=(ranking == 1 and _safe_price(flight.price) != float('inf')),
                         url=flight_url,
                     )
                 )
@@ -376,6 +413,35 @@ def serializar_resultados(resultados_por_ruta: dict, origen: str = "", destino: 
         total_vuelos=len(vuelos),
         vuelos=vuelos,
     )
+
+
+# ============================================================================
+# RESOLUCIÓN DE PRECIOS OCULTOS EN BACKGROUND
+# ============================================================================
+
+def _resolver_precio_background(price_req: PriceRequest, resolve_id: str) -> None:
+    """Hilo daemon que reintenta hasta 100 veces obtener el precio de un vuelo con precio
+    oculto. Actualiza _resolve_jobs[resolve_id] en cada intento para que el front pueda
+    consultar el estado via GET /api/resolve-price/{resolve_id}."""
+    tag = resolve_id[:8]
+    log(f"[PRECIO] [{tag}] Iniciando: {price_req.aerolinea} {price_req.fecha} {price_req.salida}", min_level=2)
+    for intento in range(1, 16):
+        time.sleep(3.0)
+        _resolve_jobs[resolve_id]["intento"] = intento
+        log(f"[PRECIO] [{tag}] Intento {intento}/15 — {price_req.aerolinea} {price_req.fecha} {price_req.salida}", min_level=2)
+        try:
+            resp = get_price(price_req)
+            if resp.precio and _safe_price(resp.precio) != float('inf'):
+                _resolve_jobs[resolve_id]["status"] = "found"
+                _resolve_jobs[resolve_id]["precio"] = resp.precio
+                log(f"[PRECIO] [{tag}] ✓ Resuelto → {resp.precio} (intento {intento})", min_level=2)
+                return
+            else:
+                log(f"[PRECIO] [{tag}] Sin precio aún (intento {intento}) — resp: {resp.precio!r}", min_level=2)
+        except Exception as e:
+            log(f"[PRECIO] [{tag}] Error en intento {intento}: {e}", min_level=2)
+    _resolve_jobs[resolve_id]["status"] = "exhausted"
+    log(f"[PRECIO] [{tag}] ✗ Sin precio tras 100 intentos: {price_req.aerolinea} {price_req.fecha} {price_req.salida}", min_level=2)
 
 
 # ============================================================================
@@ -430,6 +496,50 @@ def ping() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/api/resolve-price", response_model=ResolveStartResponse)
+def start_resolve_price(req: PriceRequest) -> ResolveStartResponse:
+    """
+    Inicia la resolución en background del precio de un vuelo con precio oculto.
+    Devuelve un resolve_id para consultar el estado con GET /api/resolve-price/{resolve_id}.
+    """
+    resolve_id = str(uuid.uuid4())
+    _resolve_jobs[resolve_id] = {"status": "pending", "precio": None, "intento": 0}
+    threading.Thread(
+        target=_resolver_precio_background,
+        args=(req, resolve_id),
+        daemon=True,
+    ).start()
+    log(f"[PRECIO] Resolución iniciada [{resolve_id[:8]}]: {req.aerolinea} {req.fecha} {req.salida}", min_level=2)
+    return ResolveStartResponse(resolve_id=resolve_id)
+
+
+@app.get("/api/resolve-price/{resolve_id}", response_model=ResolveStatusResponse)
+def get_resolve_status(resolve_id: str) -> ResolveStatusResponse:
+    """
+    Consulta el estado de una resolución de precio iniciada con POST /api/resolve-price.
+    - status="pending"   → sigue buscando (sigue haciendo polling)
+    - status="found"     → precio encontrado en el campo `precio`
+    - status="exhausted" → 100 intentos agotados, no se encontró precio
+    """
+    if resolve_id not in _resolve_jobs:
+        raise HTTPException(status_code=404, detail="resolve_id no encontrado")
+    job = _resolve_jobs[resolve_id]
+    return ResolveStatusResponse(
+        resolve_id=resolve_id,
+        status=job["status"],
+        precio=job["precio"],
+        intento=job["intento"],
+    )
+
+
+@app.get("/api/results/{search_id}", response_model=SearchResponse)
+def get_results(search_id: str) -> SearchResponse:
+    """Devuelve los resultados actualizados de una búsqueda previa (con precios resueltos en background)."""
+    if search_id not in _search_results:
+        raise HTTPException(status_code=404, detail="Búsqueda no encontrada")
+    return _search_results[search_id]
+
+
 @app.get("/api/progress")
 def get_progress(search_id: Optional[str] = None) -> dict:
     if search_id:
@@ -477,12 +587,15 @@ def search_flights(req: SearchRequest) -> SearchResponse:
             search_id=search_id,
         )
         result = serializar_resultados(resultados)
-        return SearchResponse(
+        response = SearchResponse(
             search_id=search_id,
             rutas=result.rutas,
             total_vuelos=result.total_vuelos,
             vuelos=result.vuelos,
         )
+        # Guardar referencia viva para que /api/results devuelva datos actualizados
+        _search_results[search_id] = response
+        return response
     except Exception as e:
         log(f"[ERROR] {e}", min_level=1)
         raise HTTPException(status_code=500, detail=str(e))
