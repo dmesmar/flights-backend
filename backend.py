@@ -153,9 +153,13 @@ class ResolveStartResponse(BaseModel):
 
 class ResolveStatusResponse(BaseModel):
     resolve_id: str
-    status: str          # "pending" | "found" | "exhausted"
+    status: str          # "pending" | "found" | "exhausted" | "cancelled"
     precio: Optional[str] = None
     intento: int = 0
+
+
+class CancelRequest(BaseModel):
+    resolve_ids: List[str]
 
 
 # ============================================================================
@@ -230,9 +234,8 @@ def _buscar_dia(from_airport: str, to_airport: str, fecha_str: str, max_stops: i
                     break
         except Exception as e:
             if "No flights found" in str(e):
-                if intento < 3:
-                    time.sleep(1.5)
-            elif intento < 3:
+                break  # sin vuelos reales ese día → no reintentar
+            if intento < 3:
                 time.sleep(0.5)
 
     total_v = len(result.flights) if result and isinstance(result, Result) else 0
@@ -425,8 +428,15 @@ def _resolver_precio_background(price_req: PriceRequest, resolve_id: str) -> Non
     consultar el estado via GET /api/resolve-price/{resolve_id}."""
     tag = resolve_id[:8]
     log(f"[PRECIO] [{tag}] Iniciando: {price_req.aerolinea} {price_req.fecha} {price_req.salida}", min_level=2)
+    cancel_event: threading.Event = _resolve_jobs[resolve_id]["cancel"]
     for intento in range(1, 16):
-        time.sleep(3.0)
+        if cancel_event.is_set():
+            log(f"[PRECIO] [{tag}] Cancelado en intento {intento}", min_level=2)
+            return
+        time.sleep(1.0)
+        if cancel_event.is_set():
+            log(f"[PRECIO] [{tag}] Cancelado tras espera intento {intento}", min_level=2)
+            return
         _resolve_jobs[resolve_id]["intento"] = intento
         log(f"[PRECIO] [{tag}] Intento {intento}/15 — {price_req.aerolinea} {price_req.fecha} {price_req.salida}", min_level=2)
         try:
@@ -496,6 +506,24 @@ def ping() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/api/resolve-price/cancel")
+def cancel_resolve_prices(req: CancelRequest) -> dict:
+    """
+    Cancela trabajos de resolución de precio activos.
+    Llamado por el front vía sendBeacon al cerrar/recargar la página.
+    Siempre devuelve 200 con el número de trabajos cancelados.
+    """
+    cancelled = 0
+    for rid in req.resolve_ids:
+        job = _resolve_jobs.get(rid)
+        if job and job["status"] == "pending":
+            job["cancel"].set()
+            job["status"] = "cancelled"
+            cancelled += 1
+            log(f"[PRECIO] [{rid[:8]}] Cancelado por el cliente", min_level=2)
+    return {"cancelled": cancelled}
+
+
 @app.post("/api/resolve-price", response_model=ResolveStartResponse)
 def start_resolve_price(req: PriceRequest) -> ResolveStartResponse:
     """
@@ -503,7 +531,7 @@ def start_resolve_price(req: PriceRequest) -> ResolveStartResponse:
     Devuelve un resolve_id para consultar el estado con GET /api/resolve-price/{resolve_id}.
     """
     resolve_id = str(uuid.uuid4())
-    _resolve_jobs[resolve_id] = {"status": "pending", "precio": None, "intento": 0}
+    _resolve_jobs[resolve_id] = {"status": "pending", "precio": None, "intento": 0, "cancel": threading.Event()}
     threading.Thread(
         target=_resolver_precio_background,
         args=(req, resolve_id),
