@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from urllib.parse import urlencode
 from fast_flights import create_filter, get_flights_from_filter, FlightData, Passengers
 from fast_flights.schema import Result
+from geo import get_nearby_airports as _geo_nearby, get_airport_distance as _geo_distance
 
 # ============================================================================
 # LOG LEVEL  (0=silent, 1=basic, 2=normal, 3=debug)
@@ -160,6 +161,18 @@ class ResolveStatusResponse(BaseModel):
 
 class CancelRequest(BaseModel):
     resolve_ids: List[str]
+
+
+class NearbyAirportResult(BaseModel):
+    iata: str
+    distance_km: int
+
+
+class NearbyAirportsResponse(BaseModel):
+    iata: str
+    radius_km: float
+    count: int
+    airports: List[NearbyAirportResult]
 
 
 # ============================================================================
@@ -499,6 +512,23 @@ def get_price(req: PriceRequest) -> PriceResponse:
                 time.sleep(0.5)
 
     return PriceResponse(precio=None)
+
+
+@app.get("/api/nearby-airports", response_model=NearbyAirportsResponse)
+def get_nearby_airports_endpoint(iata: str, radius_km: float = 100.0) -> NearbyAirportsResponse:
+    """
+    Returns European airports within *radius_km* of the given *iata* code,
+    sorted by ascending distance.  Only airports present in the geo module's
+    coordinate dataset are considered.
+    """
+    iata = iata.strip().upper()
+    results = _geo_nearby(iata, radius_km)
+    return NearbyAirportsResponse(
+        iata=iata,
+        radius_km=radius_km,
+        count=len(results),
+        airports=[NearbyAirportResult(**r) for r in results],
+    )
 
 
 @app.get("/api/ping")
